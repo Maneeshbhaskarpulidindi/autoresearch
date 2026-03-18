@@ -87,6 +87,165 @@ I think these would be the reasonable hyperparameters to play with. Ask your fav
 - [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
 - [andyluo7/autoresearch](https://github.com/andyluo7/autoresearch) (AMD)
 
+## The Idea & How It Works
+
+### Core Concept
+
+The fundamental idea behind autoresearch is a **paradigm shift**: instead of the human writing ML training code, the human writes *instructions for an AI agent* (`program.md`), and the agent writes and iterates on the actual training code (`train.py`). The human becomes a **meta-programmer** — programming the researcher, not the research.
+
+### The Autonomous Experiment Loop
+
+The agent follows a simple but powerful **greedy hill-climbing** loop:
+
+```
+LOOP FOREVER:
+  1. Propose a hypothesis (e.g. "increase learning rate to 0.04")
+  2. Edit train.py with the change
+  3. Git commit
+  4. Run training (fixed 5-minute budget)
+  5. Read the result metric (val_bpb)
+  6. If improved → KEEP (advance the branch)
+     If worse   → DISCARD (git reset)
+  7. Log results to results.tsv
+```
+
+Each experiment is **exactly 5 minutes** of wall-clock training. This means:
+- **~12 experiments per hour**, ~100 overnight while you sleep
+- Results are **directly comparable** regardless of what was changed
+- The agent finds the **optimal model for your specific hardware**
+
+### Implementation Architecture
+
+The system has a strict separation of concerns:
+
+| Component | File | Who Controls It |
+|-----------|------|-----------------|
+| Agent instructions | `program.md` | Human edits this |
+| Model + optimizer + training loop | `train.py` | Agent edits this |
+| Data, tokenizer, evaluation metric | `prepare.py` | Nobody (read-only) |
+
+The agent can modify **everything** in `train.py`: model architecture (depth, width, attention heads), optimizer hyperparameters (learning rates, momentum, weight decay), batch size, learning rate schedule, activation functions, and more. The evaluation function in `prepare.py` is the immutable ground truth — ensuring fair comparison across all experiments.
+
+### What the Agent Tunes
+
+The default `train.py` exposes these major parameter categories:
+
+- **Architecture**: `DEPTH`, `ASPECT_RATIO`, `HEAD_DIM`, `WINDOW_PATTERN`
+- **Optimizer**: `MATRIX_LR`, `EMBEDDING_LR`, `UNEMBEDDING_LR`, `WEIGHT_DECAY`, `ADAM_BETAS`
+- **Schedule**: `WARMUP_RATIO`, `WARMDOWN_RATIO`, `FINAL_LR_FRAC`
+- **Batch sizing**: `TOTAL_BATCH_SIZE`, `DEVICE_BATCH_SIZE`
+- **And everything else**: activation functions, normalization, RoPE frequency, value embeddings, etc.
+
+The agent uses its knowledge of deep learning to propose changes, and the keep/discard mechanism acts as a natural filter — only improvements survive.
+
+---
+
+## Using Autoresearch With Your Own Custom Model
+
+The autoresearch pattern is **model-agnostic**. You can adapt it to optimize any ML model — image classifiers, object detectors, speech models, RL agents, etc. Here's how:
+
+### Step 1: Create Your Training Script
+
+Create a `train.py` (or equivalent) that:
+- Contains your full model definition, optimizer, and training loop
+- Has clearly labeled hyperparameters at the top that the agent can tune
+- Runs for a **fixed time budget** (e.g. 5 minutes)
+- Prints a single evaluation metric at the end
+
+```python
+# Example: Custom image classifier train.py
+# --- Hyperparameters (agent tunes these) ---
+LEARNING_RATE = 0.001
+BATCH_SIZE = 32
+NUM_LAYERS = 4
+HIDDEN_DIM = 256
+DROPOUT = 0.1
+OPTIMIZER = "adamw"
+AUGMENTATION = "basic"
+
+# ... model definition, training loop ...
+
+# Print result in a parseable format
+print(f"val_accuracy: {val_acc:.6f}")
+print(f"val_loss: {val_loss:.6f}")
+print(f"peak_vram_mb: {peak_mem:.1f}")
+```
+
+### Step 2: Create Your Evaluation (Keep It Separate & Read-Only)
+
+Put your evaluation logic in a **separate file** that the agent cannot modify:
+
+```python
+# evaluate.py (read-only, like prepare.py)
+def evaluate(model, val_loader):
+    # Your fixed evaluation metric
+    # Returns a single number: lower = better (or higher = better)
+    return val_loss
+```
+
+### Step 3: Write Your `program.md`
+
+Adapt the instructions to your model. The key sections are:
+
+```markdown
+# My Custom Model Research
+
+## What you CAN do:
+- Modify train.py — architecture, optimizer, hyperparameters, augmentation, etc.
+
+## What you CANNOT do:
+- Modify evaluate.py or data loading
+- Install new packages
+
+## The goal: get the lowest val_loss (or highest val_accuracy)
+
+## Experiment loop:
+1. Edit train.py with an idea
+2. Git commit
+3. Run: python train.py > run.log 2>&1
+4. Check: grep "^val_loss:" run.log
+5. If improved → keep. If worse → git reset.
+6. Log to results.tsv
+7. Repeat forever.
+```
+
+### Step 4: Run the Agent
+
+Point your AI agent (Claude, Codex, Gemini, etc.) at the repo and say:
+
+```
+Read program.md and start experimenting. Establish a baseline first.
+```
+
+### Example Adaptations
+
+| Use Case | Metric to Optimize | What Agent Tunes |
+|----------|-------------------|------------------|
+| Image Classification | `val_accuracy` (↑) | LR, architecture, augmentation, optimizer |
+| Object Detection (YOLO) | `val_mAP` (↑) | Anchors, backbone, neck, augmentation |
+| Text Classification | `val_f1` (↑) | Embedding dim, layers, dropout, LR |
+| Speech Recognition | `val_wer` (↓) | Model size, spectrogram params, decoder |
+| Reinforcement Learning | `episode_reward` (↑) | Network size, reward shaping, exploration |
+| Image Generation | `val_fid` (↓) | UNet depth, noise schedule, LR |
+
+### Tips for Best Results
+
+1. **Keep experiments fast** — 5-10 minutes each is ideal. The agent benefits from rapid iteration.
+2. **One clear metric** — the keep/discard decision must be unambiguous.
+3. **Label your hyperparameters** — put them at the top of the file with comments so the agent understands what each one does.
+4. **Start simple** — let the agent establish a baseline with default settings first.
+5. **Don't over-constrain** — the more freedom the agent has, the more creative its solutions can be.
+6. **Use git branches** — each experiment run is a commit, so you get a full history of what was tried.
+
+### Key Constraints to Be Aware Of
+
+- **Greedy search**: the agent does hill-climbing, so it can get stuck in local optima. It won't explore radically different architectures if the current one is "good enough."
+- **Fast feedback required**: models that take hours to train won't benefit much — the agent needs rapid iteration cycles.
+- **Agent knowledge**: the agent proposes ideas based on its training data, so it works best for well-studied model types (transformers, CNNs, etc.).
+- **Single metric**: if your task has multiple objectives (accuracy vs. speed vs. size), you need to combine them into one number.
+
+---
+
 ## License
 
 MIT
